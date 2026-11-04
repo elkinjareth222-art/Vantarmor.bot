@@ -18,8 +18,8 @@ if not TOKEN:
 
 GUILD = discord.Object(id=GUILD_ID)
 
-# Message Content se necesita para comandos ?... y respuestas numéricas.
-# Members se necesita para autorole y eventos de entrada.
+# Message Content es necesario para comandos ?... y respuestas numéricas.
+# Members es necesario para autorole y eventos de entrada.
 intents = discord.Intents.default()
 intents.guild_messages = True
 intents.message_content = True
@@ -28,13 +28,13 @@ intents.members = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# Estos datos viven en memoria y se reinician al reiniciar el proceso.
 afk_users = {}
 autoroles = {}
 invite_cache = {}
 invite_counts = {}
 active_number_games = {}
 number_game_lock = asyncio.Lock()
+blocked_words = {}
 
 
 def formato_duracion(segundos: float) -> str:
@@ -48,9 +48,13 @@ def formato_duracion(segundos: float) -> str:
     return ", ".join(resultado) if resultado else "0 segundos"
 
 
+def normalizar_texto(texto: str) -> str:
+    texto = unicodedata.normalize("NFD", texto.casefold())
+    return "".join(c for c in texto if unicodedata.category(c) != "Mn")
+
+
 def analizar_duracion(texto: str) -> Optional[int]:
-    texto = unicodedata.normalize("NFD", texto.strip().lower())
-    texto = "".join(c for c in texto if unicodedata.category(c) != "Mn")
+    texto = normalizar_texto(texto.strip())
     match = re.fullmatch(
         r"(\d+)\s*(meses?|minutos?|mins?|m|horas?|hrs?|h|dias?|d|segundos?|segs?|s)",
         texto,
@@ -111,6 +115,46 @@ async def moderar_miembro(
         return "No pude completar la acción por un error de Discord."
 
 
+async def cambiar_bloqueo_canal(
+    channel: discord.abc.GuildChannel,
+    actor: discord.Member,
+    bloquear: bool,
+) -> str:
+    guild = channel.guild
+    bot_member = guild.me
+    if not actor.guild_permissions.manage_channels:
+        return "Necesitas el permiso Administrar canales."
+    if bot_member is None or not bot_member.guild_permissions.manage_channels:
+        return "Al bot le falta el permiso Administrar canales."
+    if not isinstance(channel, discord.TextChannel):
+        return "Este comando solo funciona en canales de texto."
+
+    permiso = channel.overwrites_for(guild.default_role)
+    permiso.send_messages = False if bloquear else None
+    try:
+        if permiso.is_empty():
+            await channel.set_permissions(guild.default_role, overwrite=None)
+        else:
+            await channel.set_permissions(
+                guild.default_role,
+                overwrite=permiso,
+                reason=f"Canal {'bloqueado' if bloquear else 'desbloqueado'} por {actor}",
+            )
+    except discord.Forbidden:
+        return "No pude cambiar los permisos del canal. Revisa el rol y permisos del bot."
+    except discord.HTTPException:
+        return "Discord devolvió un error al cambiar los permisos del canal."
+
+    return f"🔒 {channel.mention} quedó bloqueado." if bloquear else f"🔓 {channel.mention} quedó desbloqueado."
+
+
+async def eliminar_mensajes(channel, cantidad: int) -> int:
+    if not hasattr(channel, "purge"):
+        raise TypeError("Este canal no permite eliminar mensajes en lote.")
+    mensajes = await channel.purge(limit=cantidad, bulk=False)
+    return len(mensajes)
+
+
 @tree.command(name="ping", description="Comprueba si el bot responde", guild=GUILD)
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("¡Pong! ✅")
@@ -127,9 +171,11 @@ async def hola(interaction: discord.Interaction):
 @tree.command(name="ayuda", description="Muestra los comandos disponibles", guild=GUILD)
 async def ayuda(interaction: discord.Interaction):
     await interaction.response.send_message(
-        "**Comandos:** `/ping`, `/hola`, `/afk`, `/avatar`, `/sorteo`, "
-        "`/cookie game`, `/número`, `/autorole`, `/ban`, `/kick`, `/invite` y `/anuncio`.\n"
-        "También: `?afk motivo`, `?avatar` y responde a un mensaje con `?ban` o `?kick`.",
+        "**Comandos:** `/ping`, `/hola`, `/afk`, `/avatar`, `/sorteo`, `/cookie game`, ` /número`, "
+        "`/autorole`, `/ban`, `/kick`, `/invite`, `/lock`, `/unlock`, `/bloqueo_palabra`, "
+        "`/desbloqueo_palabra`, `/purge` y `/anuncio`.\n"
+        "También: `?afk motivo`, `?avatar`, responde a un mensaje con `?ban` o `?kick`, "
+        "y usa `?lock`, `?unlock` o `?purge 16`.",
         ephemeral=True,
     )
 
@@ -321,14 +367,9 @@ async def numero_game(interaction: discord.Interaction, numero: app_commands.Ran
         return
     async with number_game_lock:
         if interaction.guild_id in active_number_games:
-            await interaction.response.send_message(
-                "Ya hay una partida activa en este servidor.", ephemeral=True
-            )
+            await interaction.response.send_message("Ya hay una partida activa en este servidor.", ephemeral=True)
             return
-        active_number_games[interaction.guild_id] = {
-            "numero": numero,
-            "autor_id": interaction.user.id,
-        }
+        active_number_games[interaction.guild_id] = {"numero": numero, "autor_id": interaction.user.id}
     await interaction.response.send_message("Partida iniciada. El número no se mostrará aquí.", ephemeral=True)
     await interaction.channel.send(
         f"🎲 {interaction.user.mention} está pensando en un número del 1 al 200. ¡Adivínenlo antes que los demás!",
@@ -403,6 +444,84 @@ async def invite_command(interaction: discord.Interaction, usuario: Optional[dis
     )
 
 
+@tree.command(name="lock", description="Bloquea el canal actual", guild=GUILD)
+@app_commands.default_permissions(manage_channels=True)
+async def lock_command(interaction: discord.Interaction):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member) or interaction.channel is None:
+        await interaction.response.send_message("Úsalo dentro de un canal del servidor.", ephemeral=True)
+        return
+    resultado = await cambiar_bloqueo_canal(interaction.channel, interaction.user, True)
+    await interaction.response.send_message(resultado)
+
+
+@tree.command(name="unlock", description="Desbloquea el canal actual", guild=GUILD)
+@app_commands.default_permissions(manage_channels=True)
+async def unlock_command(interaction: discord.Interaction):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member) or interaction.channel is None:
+        await interaction.response.send_message("Úsalo dentro de un canal del servidor.", ephemeral=True)
+        return
+    resultado = await cambiar_bloqueo_canal(interaction.channel, interaction.user, False)
+    await interaction.response.send_message(resultado)
+
+
+@tree.command(name="bloqueo_palabra", description="Añade una palabra al filtro del servidor", guild=GUILD)
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(palabra="Palabra o frase que se eliminará de mensajes de miembros")
+async def bloqueo_palabra(interaction: discord.Interaction, palabra: str):
+    if interaction.guild_id is None or not interaction.user.guild_permissions.manage_messages:
+        await interaction.response.send_message("Necesitas Administrar mensajes para configurar el filtro.", ephemeral=True)
+        return
+    palabra = palabra.strip()
+    if not palabra or len(palabra) > 100:
+        await interaction.response.send_message("Escribe una palabra o frase de 1 a 100 caracteres.", ephemeral=True)
+        return
+    clave = normalizar_texto(palabra)
+    lista = blocked_words.setdefault(interaction.guild_id, set())
+    if clave in lista:
+        await interaction.response.send_message("Esa palabra ya está bloqueada.", ephemeral=True)
+        return
+    lista.add(clave)
+    await interaction.response.send_message(f"✅ Se añadió `{palabra}` al filtro.", ephemeral=True)
+
+
+@tree.command(name="desbloqueo_palabra", description="Quita una palabra del filtro", guild=GUILD)
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(palabra="Palabra o frase que quieres desbloquear")
+async def desbloqueo_palabra(interaction: discord.Interaction, palabra: str):
+    if interaction.guild_id is None or not interaction.user.guild_permissions.manage_messages:
+        await interaction.response.send_message("Necesitas Administrar mensajes para configurar el filtro.", ephemeral=True)
+        return
+    clave = normalizar_texto(palabra.strip())
+    lista = blocked_words.setdefault(interaction.guild_id, set())
+    if clave not in lista:
+        await interaction.response.send_message("Esa palabra no está en la lista de bloqueadas.", ephemeral=True)
+        return
+    lista.remove(clave)
+    await interaction.response.send_message(f"✅ Se quitó `{palabra.strip()}` del filtro.", ephemeral=True)
+
+
+@tree.command(name="purge", description="Elimina mensajes recientes del canal", guild=GUILD)
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(cantidad="Cantidad de mensajes que se eliminarán (1 a 100)")
+async def purge_command(interaction: discord.Interaction, cantidad: app_commands.Range[int, 1, 100]):
+    if interaction.channel is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Úsalo dentro de un canal del servidor.", ephemeral=True)
+        return
+    if not interaction.user.guild_permissions.manage_messages:
+        await interaction.response.send_message("Necesitas el permiso Administrar mensajes.", ephemeral=True)
+        return
+    bot_member = interaction.guild.me if interaction.guild else None
+    if bot_member is None or not bot_member.guild_permissions.manage_messages:
+        await interaction.response.send_message("Al bot le falta Administrar mensajes.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        eliminados = await eliminar_mensajes(interaction.channel, cantidad)
+        await interaction.followup.send(f"🧹 Eliminé {eliminados} mensaje(s).", ephemeral=True)
+    except (discord.Forbidden, discord.HTTPException, TypeError) as error:
+        await interaction.followup.send(f"No pude eliminar los mensajes: {error}", ephemeral=True)
+
+
 @tree.command(name="anuncio", description="Envía un anuncio importante", guild=GUILD)
 @app_commands.default_permissions(manage_messages=True)
 @app_commands.describe(mensaje="Texto obligatorio del anuncio")
@@ -467,10 +586,48 @@ async def on_message(message: discord.Message):
 
     content = message.content.strip()
     lower_content = content.lower()
-    parts = content.split(maxsplit=1)
+    parts = content.split(maxsplit=2)
     command = parts[0].lower() if parts else ""
 
-    # ?ban y ?kick requieren responder al mensaje del miembro objetivo.
+    if lower_content in ("?lock", "?unlock"):
+        if not isinstance(message.author, discord.Member):
+            return
+        bloquear = lower_content == "?lock"
+        resultado = await cambiar_bloqueo_canal(message.channel, message.author, bloquear)
+        await message.channel.send(resultado, delete_after=8)
+        return
+
+    purge_count = None
+    if command == "?purge" and len(parts) == 2:
+        try:
+            purge_count = int(parts[1])
+        except ValueError:
+            purge_count = -1
+    elif command == "?" and len(parts) == 3 and parts[1].lower() == "purge":
+        try:
+            purge_count = int(parts[2])
+        except ValueError:
+            purge_count = -1
+
+    if purge_count is not None:
+        if not isinstance(message.author, discord.Member) or not message.author.guild_permissions.manage_messages:
+            await message.channel.send("Necesitas el permiso Administrar mensajes.", delete_after=8)
+            return
+        bot_member = message.guild.me
+        if bot_member is None or not bot_member.guild_permissions.manage_messages:
+            await message.channel.send("Al bot le falta Administrar mensajes.", delete_after=8)
+            return
+        if not 1 <= purge_count <= 100:
+            await message.channel.send("Indica una cantidad entre 1 y 100, por ejemplo `?purge 16`.", delete_after=8)
+            return
+        try:
+            await message.delete()
+            eliminados = await eliminar_mensajes(message.channel, purge_count)
+            await message.channel.send(f"🧹 Eliminé {eliminados} mensaje(s).", delete_after=6)
+        except (discord.Forbidden, discord.HTTPException, TypeError) as error:
+            await message.channel.send(f"No pude eliminar los mensajes: {error}", delete_after=8)
+        return
+
     if lower_content in ("?ban", "?kick"):
         if not isinstance(message.author, discord.Member):
             return
@@ -496,7 +653,6 @@ async def on_message(message: discord.Message):
         await message.channel.send(result, allowed_mentions=discord.AllowedMentions.none())
         return
 
-    # ?afk acepta un motivo opcional, por ejemplo: ?afk durmiendo
     if command == "?afk":
         reason = parts[1].strip() if len(parts) > 1 else "Sin motivo"
         await activar_afk(message.guild.id, message.author, reason)
@@ -506,7 +662,6 @@ async def on_message(message: discord.Message):
         )
         return
 
-    # Cualquier mensaje normal elimina el AFK del autor.
     own_key = (message.guild.id, message.author.id)
     afk_state = afk_users.pop(own_key, None)
     if afk_state:
@@ -516,7 +671,6 @@ async def on_message(message: discord.Message):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-    # ?avatar muestra al autor del mensaje respondido, o al autor del comando.
     if command == "?avatar":
         target_user = message.author
         reference = message.reference
@@ -531,7 +685,18 @@ async def on_message(message: discord.Message):
         await message.channel.send(embed=await crear_embed_avatar(target_user))
         return
 
-    # La partida puede adivinarse en cualquier canal del servidor.
+    if isinstance(message.author, discord.Member) and not message.author.guild_permissions.administrator:
+        words = blocked_words.get(message.guild.id, set())
+        normalized_message = normalizar_texto(message.content)
+        for word in words:
+            pattern = rf"(?<!\w){re.escape(word)}(?!\w)"
+            if re.search(pattern, normalized_message):
+                try:
+                    await message.delete()
+                except (discord.Forbidden, discord.HTTPException) as error:
+                    print(f"No pude borrar mensaje con palabra bloqueada: {error}")
+                return
+
     if content.isdecimal():
         async with number_game_lock:
             game = active_number_games.get(message.guild.id)
@@ -553,7 +718,6 @@ async def on_message(message: discord.Message):
             )
             return
 
-    # Avisar si mencionan a alguien AFK.
     seen = set()
     for user in message.mentions:
         key = (message.guild.id, user.id)
