@@ -37,6 +37,11 @@ number_game_lock = asyncio.Lock()
 blocked_words = {}
 
 
+def normalizar_texto(texto: str) -> str:
+    texto = unicodedata.normalize("NFD", texto.casefold())
+    return "".join(c for c in texto if unicodedata.category(c) != "Mn")
+
+
 def formato_duracion(segundos: float) -> str:
     segundos = max(0, int(segundos))
     unidades = [("día", 86400), ("hora", 3600), ("minuto", 60), ("segundo", 1)]
@@ -46,11 +51,6 @@ def formato_duracion(segundos: float) -> str:
         if valor:
             resultado.append(f"{valor} {nombre if valor == 1 else nombre + 's'}")
     return ", ".join(resultado) if resultado else "0 segundos"
-
-
-def normalizar_texto(texto: str) -> str:
-    texto = unicodedata.normalize("NFD", texto.casefold())
-    return "".join(c for c in texto if unicodedata.category(c) != "Mn")
 
 
 def analizar_duracion(texto: str) -> Optional[int]:
@@ -115,11 +115,7 @@ async def moderar_miembro(
         return "No pude completar la acción por un error de Discord."
 
 
-async def cambiar_bloqueo_canal(
-    channel: discord.abc.GuildChannel,
-    actor: discord.Member,
-    bloquear: bool,
-) -> str:
+async def cambiar_bloqueo_canal(channel: discord.abc.GuildChannel, actor: discord.Member, bloquear: bool) -> str:
     guild = channel.guild
     bot_member = guild.me
     if not actor.guild_permissions.manage_channels:
@@ -129,15 +125,16 @@ async def cambiar_bloqueo_canal(
     if not isinstance(channel, discord.TextChannel):
         return "Este comando solo funciona en canales de texto."
 
-    permiso = channel.overwrites_for(guild.default_role)
-    permiso.send_messages = False if bloquear else None
+    overwrite = channel.overwrites_for(guild.default_role)
+    overwrite.send_messages = False if bloquear else None
+
     try:
-        if permiso.is_empty():
+        if overwrite.is_empty():
             await channel.set_permissions(guild.default_role, overwrite=None)
         else:
             await channel.set_permissions(
                 guild.default_role,
-                overwrite=permiso,
+                overwrite=overwrite,
                 reason=f"Canal {'bloqueado' if bloquear else 'desbloqueado'} por {actor}",
             )
     except discord.Forbidden:
@@ -171,11 +168,10 @@ async def hola(interaction: discord.Interaction):
 @tree.command(name="ayuda", description="Muestra los comandos disponibles", guild=GUILD)
 async def ayuda(interaction: discord.Interaction):
     await interaction.response.send_message(
-        "**Comandos:** `/ping`, `/hola`, `/afk`, `/avatar`, `/sorteo`, `/cookie game`, ` /número`, "
+        "**Comandos:** `/ping`, `/hola`, `/afk`, `/avatar`, `/sorteo`, `/cookie game`, `/número`, "
         "`/autorole`, `/ban`, `/kick`, `/invite`, `/lock`, `/unlock`, `/bloqueo_palabra`, "
-        "`/desbloqueo_palabra`, `/purge` y `/anuncio`.\n"
-        "También: `?afk motivo`, `?avatar`, responde a un mensaje con `?ban` o `?kick`, "
-        "y usa `?lock`, `?unlock` o `?purge 16`.",
+        "`/desbloqueo_palabra`, `/purge`, `/anuncio`.\n"
+        "También: `?afk motivo`, `?avatar`, `?lock`, `?unlock`, `?purge 16`, `?ban`, `?kick`.",
         ephemeral=True,
     )
 
@@ -589,6 +585,7 @@ async def on_message(message: discord.Message):
     parts = content.split(maxsplit=2)
     command = parts[0].lower() if parts else ""
 
+    # ?lock / ?unlock bloquean o desbloquean el canal donde se escribió el comando.
     if lower_content in ("?lock", "?unlock"):
         if not isinstance(message.author, discord.Member):
             return
@@ -597,6 +594,7 @@ async def on_message(message: discord.Message):
         await message.channel.send(resultado, delete_after=8)
         return
 
+    # ?purge 16 (también acepta la forma ? purge 16).
     purge_count = None
     if command == "?purge" and len(parts) == 2:
         try:
